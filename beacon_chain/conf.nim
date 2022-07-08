@@ -528,6 +528,11 @@ type
         desc: "Suggested fee recipient"
         name: "suggested-fee-recipient" .}: Option[Address]
 
+      payloadBuilder* {.
+        hidden
+        desc: "Payload builder URL"
+        name: "payload-builder" .}: Option[string]
+
     of BNStartUpCmd.createTestnet:
       testnetDepositsFile* {.
         desc: "A LaunchPad deposits file for the genesis state validators"

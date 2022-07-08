@@ -768,6 +768,14 @@ proc init*(T: type BeaconNode,
       max(Moment.init(bellatrixEpochTime, Second),
           Moment.now)
 
+  let restClient =
+    if config.payloadBuilder.isSome:
+      RestClientRef.new(config.payloadBuilder.get).valueOr:
+        warn "FOO: payload builder REST client setup failed"
+        nil
+    else:
+      nil
+
   let node = BeaconNode(
     nickname: nickname,
     graffitiBytes: if config.graffiti.isSome: config.graffiti.get
@@ -778,6 +786,7 @@ proc init*(T: type BeaconNode,
     config: config,
     attachedValidators: validatorPool,
     eth1Monitor: eth1Monitor,
+    restClient: restClient,
     restServer: restServer,
     keymanagerServer: keymanagerServer,
     keymanagerToken: keymanagerToken,

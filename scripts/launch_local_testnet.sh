@@ -641,7 +641,7 @@ else
   ganache-cli --blockTime 17 --gasLimit 100000000 -e 100000 --verbose > "${DATA_DIR}/log_ganache.txt" 2>&1 &
   PIDS="${PIDS},$!"
 
-  WEB3_ARG="--web3-url=ws://localhost:8545"
+  WEB3_ARG="--web3-url=http://127.0.0.1:8551 --payload-builder=http://127.0.0.1:28545"
 
   echo "Deploying deposit contract"
   DEPLOY_CMD_OUTPUT=$(./build/deposit_contract deploy $WEB3_ARG)
@@ -675,6 +675,7 @@ echo Wrote $RUNTIME_CONFIG_FILE:
 
 # TODO the runtime config file should be used during deposit generation as well!
 tee "$RUNTIME_CONFIG_FILE" <<EOF
+DEPOSIT_NETWORK_ID: 1
 PRESET_BASE: ${CONST_PRESET}
 MIN_GENESIS_ACTIVE_VALIDATOR_COUNT: ${TOTAL_VALIDATORS}
 MIN_GENESIS_TIME: 0
@@ -683,6 +684,7 @@ DEPOSIT_CONTRACT_ADDRESS: ${DEPOSIT_CONTRACT_ADDRESS}
 ETH1_FOLLOW_DISTANCE: 1
 ALTAIR_FORK_EPOCH: 1
 BELLATRIX_FORK_EPOCH: 2
+TERMINAL_TOTAL_DIFFICULTY: 0
 EOF
 
 if [[ "${LIGHTHOUSE_VC_NODES}" != "0" ]]; then
@@ -867,7 +869,7 @@ for NUM_NODE in $(seq 0 $(( NUM_NODES - 1 ))); do
   fi
 
   if [ ${#EL_RPC_PORTS[@]} -eq 0 ]; then # check if the array is empty
-    WEB3_ARG=""
+    WEB3_ARG="--web3-url=http://127.0.0.1:8551 --payload-builder=http://127.0.0.1:28545"
   else
     WEB3_ARG="--web3-url=http://127.0.0.1:${EL_RPC_PORTS[${NUM_NODE}]}"
   fi

@@ -41,7 +41,8 @@ import
   ../sszdump, ../sync/sync_manager,
   ../gossip_processing/block_processor,
   ".."/[conf, beacon_clock, beacon_node],
-  "."/[slashing_protection, validator_pool, keystore_management]
+  "."/[slashing_protection, validator_pool, keystore_management],
+  ".."/spec/mev/rest_bellatrix_mev_calls
 
 from eth/async_utils import awaitWithTimeout
 from web3/engine_api import ForkchoiceUpdatedResponse
@@ -364,6 +365,7 @@ proc getExecutionPayload(
           node.eth1Monitor.terminalBlockHash.get.asEth2Digest
         else:
           default(Eth2Digest)
+      # TODO be consistent here and use same head as caller, not node.dag.head
       executionBlockRoot = node.dag.loadExecutionBlockRoot(node.dag.head)
       latestHead =
         if not executionBlockRoot.isZero:
@@ -454,7 +456,8 @@ proc makeBeaconBlockForHeadAndSlot*(node: BeaconNode,
             is_merge_transition_complete(proposalState.bellatrixData.data) or
             ((not node.eth1Monitor.isNil) and
              node.eth1Monitor.terminalBlockHash.isSome)):
-        default(bellatrix.ExecutionPayload)
+        # https://github.com/nim-lang/Nim/issues/19802
+        (static(default(bellatrix.ExecutionPayload)))
       else:
         let pubkey = node.dag.validatorKey(validator_index)
         (await getExecutionPayload(
@@ -475,6 +478,18 @@ proc makeBeaconBlockForHeadAndSlot*(node: BeaconNode,
     error "Cannot get proposal state - skipping block production, database corrupt?",
       head = shortLog(head),
       slot
+
+proc getBlindedExecutionPayload(
+    node: BeaconNode, head: BlockRef, slot: Slot, pubkey: ValidatorPubKey):
+    Future[ExecutionPayloadHeader] {.async.} =
+  # TODO verify signature
+  if node.restClient.isNil:
+    warn "getBlindedExecutionPayload: node.restClient is nil"
+    return (static(default(ExecutionPayloadHeader)))
+  return (await node.restClient.getHeader(
+    slot, head.bid.root, pubkey)).data.data.message.header
+
+import std/macros
 
 proc proposeBlock(node: BeaconNode,
                   validator: AttachedValidator,
@@ -503,7 +518,99 @@ proc proposeBlock(node: BeaconNode,
           return head
         res.get()
 
-    newBlock = await makeBeaconBlockForHeadAndSlot(
+  if  node.config.payloadBuilder.isSome and
+      slot.epoch >= node.dag.cfg.BELLATRIX_FORK_EPOCH:
+    # TODO error handling probably above
+    let
+      maybePubkey = node.dag.validatorKey(validator_index)
+      pubkey =
+        if maybePubkey.isSome:
+          maybePubkey.get.toPubKey
+        else:
+          warn "makeBeaconBlockForHeadAndSlot: couldn't get pubkey",
+            validator_index
+          # https://github.com/nim-lang/Nim/issues/19802
+          (static(default(ValidatorPubKey)))
+
+    # TODO refactor this not to make pointless EL call
+    # so split out the getPayload part from the rest at
+    # least optionally. for now, use expediently. there
+    # is also assign2, etc.
+    let newBlock = await makeBeaconBlockForHeadAndSlot(
+      node, randao, validator_index, node.graffitiBytes, head, slot)
+
+    if newBlock.isErr():
+      # not just MEV error, wouldn't be able to produce non-MEV block either
+      return head
+
+    let forkedBlck = newBlock.get()
+
+    func getFieldNames(x: typedesc[auto]): seq[string] {.compileTime.} =
+      var res: seq[string]
+      for name, _ in fieldPairs(default(x)):
+        res.add name
+      res
+
+    macro copyFields(a1: untyped, b1: untyped, b2: static[seq[string]]): untyped =
+      result = newStmtList()
+      for name in b2:
+        if name notin [
+            "transactions_root", "execution_payload",
+            "execution_payload_header", "body"]:
+          result.add newAssignment(
+            newDotExpr(a1, ident(name)), newDotExpr(b1, ident(name)))
+          #echo repr(result[^1])
+
+    var blindedBlck: SignedBlindedBeaconBlock
+    const
+      blckFields = getFieldNames(typeof(forkedBlck.bellatrixData))
+      blckBodyFields = getFieldNames(typeof(forkedBlck.bellatrixData.body))
+    copyFields(blindedBlck.message, forkedBlck.bellatrixData, blckFields)
+    copyFields(
+      blindedBlck.message.body, forkedBlck.bellatrixData.body, blckBodyFields)
+    blindedBlck.message.body.execution_payload_header =
+      await node.getBlindedExecutionPayload(head, slot, pubkey)
+
+    # TODO slashing protection integration? probably doesn't need unblinded
+    # block, so check before submitBlindedBlock and it's safe
+    # can broadcast or not, but in theory, mev does broadcast
+    let mergeMockDomain = compute_domain(
+      DOMAIN_BEACON_PROPOSER, defaultRuntimeConfig.BELLATRIX_FORK_VERSION)
+
+    info "FOO8", genesis_validators_root
+    let
+      blockRoot = hash_tree_root(blindedBlck)
+      signing_root = compute_block_signing_root(
+        fork, genesis_validators_root, slot, blockRoot)
+
+    # TODO refactor (because this is repeated for non-MEV)
+    blindedBlck.signature =
+      block:
+        let res = await validator.getBlockSignature(
+          fork, genesis_validators_root, slot, blockRoot, blindedBlck.message)
+        if res.isErr():
+          warn "Unable to sign block",
+               validator = shortLog(validator), error_msg = res.error()
+          return head
+        res.get()
+
+    # Everything until here can be aborted safely, so one can (TODO) have
+    # fallback to local EL.
+    let unblindedPayload =
+      (await node.restClient.submitBlindedBlock(blindedBlck)).data.data
+
+    doAssert hash_tree_root(unblindedPayload) ==
+      hash_tree_root(blindedBlck.message.body.execution_payload_header)
+    # TODO next step would be to hook this back to the rest of nimbus, and use
+    # the returned block, but that requires more than mergemock to work.
+    #
+    # in particular, create a fully signed block by coying the unblinded payload
+    # back to an otherwise identical block
+
+    # TODO a bit of weirdness here: mergemock isn't actually hooked up to anything,
+    # so after doing all this, do the normal version too, no matter what
+
+  let newBlock = await makeBeaconBlockForHeadAndSlot(
       node, randao, validator_index, node.graffitiBytes, head, slot)
 
   if newBlock.isErr():
