@@ -80,8 +80,9 @@ proc main(networkInfo: NetworkInfo) {.async.} =
   let validatorRegistration = getValidatorRegistration(
     networkInfo.runtimeConfig.GENESIS_FORK_VERSION,
     networkInfo.builderSigningDomain, epochTime().uint64, pubkey, privkey)
-  doAssert 200 ==
-    (await restClient.registerValidator(@[validatorRegistration])).status
+  let foo = await restClient.registerValidator(@[validatorRegistration])
+  echo foo
+  doAssert 200 == foo.status
 
   # For getHeader, need previous block's hash, to build on
   let

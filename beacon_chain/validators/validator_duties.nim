@@ -933,10 +933,11 @@ proc getValidatorRegistration(
     node: BeaconNode, pubkey: ValidatorPubKey, privkey: ValidatorPrivKey):
     SignedValidatorRegistrationV1 =
   const gasLimit = 30000000
+  let foo = node.config.getSuggestedFeeRecipient(pubkey).valueOr:
+    node.config.defaultFeeRecipient
   var validatorRegistration = SignedValidatorRegistrationV1(
     message: ValidatorRegistrationV1(
-      fee_recipient: ExecutionAddress(
-        data: distinctBase(node.getSuggestedFeeRecipient(pubkey))),
+      fee_recipient: ExecutionAddress(data: distinctBase(foo)),
       gas_limit: gasLimit,
       timestamp: epochTime().uint64,
       pubkey: pubkey))
@@ -987,9 +988,11 @@ proc handleProposal(node: BeaconNode, head: BlockRef, slot: Slot):
       fakePubkey, fakePrivKey)
     info "handleProposal: validatorRegistration",
       validatorRegistration
-    if 200 !=
-        (await node.restClient.registerValidator(@[validatorRegistration])).status:
-      warn "handleProposal: Couldn't register validator with MEV builder"
+    let registerValidatorResult =
+      await node.restClient.registerValidator(@[validatorRegistration])
+    if 200 != registerValidatorResult.status:
+      warn "handleProposal: Couldn't register validator with MEV builder",
+        registerValidatorResult
 
   return
     if validator == nil:
@@ -1111,7 +1114,8 @@ proc updateValidatorMetrics*(node: BeaconNode) =
 
 proc handleValidatorDuties*(node: BeaconNode, lastSlot, slot: Slot) {.async.} =
   ## Perform validator duties - create blocks, vote and aggregate existing votes
-  if node.attachedValidators[].count == 0:
+  if  node.attachedValidators[].count == 0 and
+      node.config.payloadBuilder.isNone:
     # Nothing to do because we have no validator attached
     return
 
