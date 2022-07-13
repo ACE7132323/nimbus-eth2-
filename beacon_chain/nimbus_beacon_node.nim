@@ -518,7 +518,7 @@ proc init*(T: type BeaconNode,
         config.web3Urls[0],
         optJwtSecret)
       if snapshotRes.isErr:
-        fatal "Failed to locate the deposit contract deployment block; ensure execution layer client is running and accessible via --web3-url",
+        fatal "Failed to locate the deposit contract deployment block",
               depositContract = cfg.DEPOSIT_CONTRACT_ADDRESS,
               deploymentBlock = $depositContractDeployedAt,
               err = snapshotRes.error
@@ -1400,8 +1400,7 @@ proc onSecond(node: BeaconNode, time: Moment) =
   # https://github.com/ethereum/execution-apis/blob/v1.0.0-alpha.9/src/engine/specification.md#engine_exchangetransitionconfigurationv1
   if time > node.nextExchangeTransitionConfTime and not node.eth1Monitor.isNil:
     node.nextExchangeTransitionConfTime = time + chronos.minutes(1)
-    if node.currentSlot.epoch >= node.dag.cfg.BELLATRIX_FORK_EPOCH:
-      traceAsyncErrors node.eth1Monitor.exchangeTransitionConfiguration()
+    traceAsyncErrors node.eth1Monitor.exchangeTransitionConfiguration()
 
   if node.config.stopAtSyncedEpoch != 0 and
       node.dag.head.slot.epoch >= node.config.stopAtSyncedEpoch:
