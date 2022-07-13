@@ -480,16 +480,142 @@ proc makeBeaconBlockForHeadAndSlot*(node: BeaconNode,
       slot
 
 proc getBlindedExecutionPayload(
-    node: BeaconNode, head: BlockRef, slot: Slot, pubkey: ValidatorPubKey):
+    node: BeaconNode,
+    slot: Slot, head: BlockRef, pubkey: ValidatorPubKey):
     Future[ExecutionPayloadHeader] {.async.} =
   # TODO verify signature
   if node.restClient.isNil:
     warn "getBlindedExecutionPayload: node.restClient is nil"
     return (static(default(ExecutionPayloadHeader)))
-  return (await node.restClient.getHeader(
-    slot, head.bid.root, pubkey)).data.data.message.header
+  let executionBlockRoot = node.dag.loadExecutionBlockRoot(head)
+  info "getBlindedExecutionPayload",
+    slot, pubkey = shortLog(pubkey), execution_root = executionBlockRoot
+  let blindedHeader = await node.restClient.getHeader(
+    slot, executionBlockRoot, pubkey)
+  if blindedHeader.status != 200:
+    info "getBlindedExecutionPayload: failed",
+      slot, pubkey = shortLog(pubkey), execution_root = executionBlockRoot,
+      blindedHeader
+    # TODO use option or result or similar
+    return default(ExecutionPayloadHeader)
+  else:
+    info "getBlindedExecutionPayload: succeeded",
+      slot, pubkey = shortLog(pubkey), execution_root = executionBlockRoot
+    # TODO use more of this, and reduce copying elsewhere?
+    return blindedHeader.data.data.message.header
 
 import std/macros
+
+proc proposeBlockMEV(
+    node: BeaconNode,
+    validator: AttachedValidator, validator_index: ValidatorIndex,
+    randao: ValidatorSig, head: BlockRef, slot: Slot,
+    fakePubkey: ValidatorPubKey, fakePrivKey: ValidatorPrivKey):
+    Future[BlockRef] {.async.} =
+  let
+    maybePubkey = node.dag.validatorKey(validator_index)
+    actualButIgnoredPubkey =
+      if maybePubkey.isSome:
+        maybePubkey.get.toPubKey
+      else:
+        warn "proposeBlockMEV: couldn't get pubkey",
+          validator_index
+        # https://github.com/nim-lang/Nim/issues/19802
+        (static(default(ValidatorPubKey)))
+    pubkey = fakePubkey   # TODO might be worth keeping as testing mode
+
+  # TODO refactor this, not to make pointless EL call
+  # so split out the getPayload part from the rest at
+  # least optionally. for now, use expediently. there
+  # is also assign2, etc.
+  let newBlock = (await makeBeaconBlockForHeadAndSlot(
+      node, randao, validator_index, node.graffitiBytes, head, slot)).valueOr:
+    # not just MEV error, wouldn't be able to produce non-MEV block either
+    return head
+
+  func getFieldNames(x: typedesc[auto]): seq[string] {.compileTime.} =
+    var res: seq[string]
+    for name, _ in fieldPairs(default(x)):
+      res.add name
+    res
+
+  macro copyFields(a1: untyped, b1: untyped, b2: static[seq[string]]): untyped =
+    result = newStmtList()
+    for name in b2:
+      if name notin [
+          "transactions_root", "execution_payload",
+          "execution_payload_header", "body"]:
+        result.add newAssignment(
+          newDotExpr(a1, ident(name)), newDotExpr(b1, ident(name)))
+        #echo repr(result[^1])
+
+  # Get blinded execution payload, directly into signed blinded block
+  var blindedBlck: SignedBlindedBeaconBlock
+  const
+    blckFields = getFieldNames(typeof(newBlock.bellatrixData))
+    blckBodyFields = getFieldNames(typeof(newBlock.bellatrixData.body))
+  copyFields(blindedBlck.message, newBlock.bellatrixData, blckFields)
+  copyFields(
+    blindedBlck.message.body, newBlock.bellatrixData.body, blckBodyFields)
+  # TODO if this fails, bail
+  blindedBlck.message.body.execution_payload_header =
+    await node.getBlindedExecutionPayload(slot, head, pubkey)
+
+  let
+    fork = node.dag.forkAtEpoch(slot.epoch)
+    genesis_validators_root = node.dag.genesis_validators_root
+
+  # TODO slashing protection integration? probably doesn't need unblinded
+  # block, so check before submitBlindedBlock, if database schema allows
+
+  # TODO only used for the fake key version
+  let proposerSigningDomain = compute_domain(
+    DOMAIN_BEACON_PROPOSER, node.dag.cfg.BELLATRIX_FORK_VERSION,
+    genesis_validators_root = genesis_validators_root)
+
+  info "proposeBlockMEV: FOO8", genesis_validators_root, proposerSigningDomain
+  let
+    blockRoot = hash_tree_root(blindedBlck)
+    signing_root = compute_block_signing_root(
+      fork, genesis_validators_root, slot, blockRoot)
+
+  # TODO refactor (because this is repeated for non-MEV)
+  blindedBlck.signature =
+    when false:
+      # TODO use real key
+      block:
+        let res = await validator.getBlockSignature(
+          fork, genesis_validators_root, slot, blockRoot, blindedBlck.message)
+        if res.isErr():
+          warn "Unable to sign block",
+               validator = shortLog(validator), error_msg = res.error()
+          return head
+        res.get()
+    else:
+      blsSign(fakePrivKey, compute_signing_root(
+        hash_tree_root(blindedBlck.message),
+        proposerSigningDomain).data).toValidatorSig
+
+  # Everything until here can be aborted safely, so one can (TODO) have
+  # fallback to local EL.
+  let unblindedPayload = await node.restClient.submitBlindedBlock(blindedBlck)
+  if unblindedPayload.status == 200:
+    info "proposeBlockMEV: succeeded",
+      unblindedPayload = unblindedPayload.data.data
+  else:
+    info "proposeBlockMEV: failed",
+      unblindedPayload = unblindedPayload
+
+  if hash_tree_root(unblindedPayload.data.data) ==
+      hash_tree_root(blindedBlck.message.body.execution_payload_header):
+    info "proposeBlockMEV: unblinding succeed"
+  else:
+    info "proposeBlockMEV: unblinding failed"
+  # TODO next step would be to hook this back to the rest of nimbus, and use
+  # the returned block, but that requires more than mergemock to work.
+  #
+  # in particular, create a fully signed block by coying the unblinded payload
+  # back to an otherwise identical block
 
 proc proposeBlock(node: BeaconNode,
                   validator: AttachedValidator,
@@ -520,95 +646,16 @@ proc proposeBlock(node: BeaconNode,
 
   if  node.config.payloadBuilder.isSome and
       slot.epoch >= node.dag.cfg.BELLATRIX_FORK_EPOCH:
-    # TODO error handling probably above
+    # Not actually proposing
     let
-      maybePubkey = node.dag.validatorKey(validator_index)
-      pubkey =
-        if maybePubkey.isSome:
-          maybePubkey.get.toPubKey
-        else:
-          warn "makeBeaconBlockForHeadAndSlot: couldn't get pubkey",
-            validator_index
-          # https://github.com/nim-lang/Nim/issues/19802
-          (static(default(ValidatorPubKey)))
-
-    # TODO refactor this not to make pointless EL call
-    # so split out the getPayload part from the rest at
-    # least optionally. for now, use expediently. there
-    # is also assign2, etc.
-    let newBlock = await makeBeaconBlockForHeadAndSlot(
-      node, randao, validator_index, node.graffitiBytes, head, slot)
-
-    if newBlock.isErr():
-      # not just MEV error, wouldn't be able to produce non-MEV block either
-      return head
-
-    let forkedBlck = newBlock.get()
-
-    func getFieldNames(x: typedesc[auto]): seq[string] {.compileTime.} =
-      var res: seq[string]
-      for name, _ in fieldPairs(default(x)):
-        res.add name
-      res
-
-    macro copyFields(a1: untyped, b1: untyped, b2: static[seq[string]]): untyped =
-      result = newStmtList()
-      for name in b2:
-        if name notin [
-            "transactions_root", "execution_payload",
-            "execution_payload_header", "body"]:
-          result.add newAssignment(
-            newDotExpr(a1, ident(name)), newDotExpr(b1, ident(name)))
-          #echo repr(result[^1])
-
-    var blindedBlck: SignedBlindedBeaconBlock
-    const
-      blckFields = getFieldNames(typeof(forkedBlck.bellatrixData))
-      blckBodyFields = getFieldNames(typeof(forkedBlck.bellatrixData.body))
-    copyFields(blindedBlck.message, forkedBlck.bellatrixData, blckFields)
-    copyFields(
-      blindedBlck.message.body, forkedBlck.bellatrixData.body, blckBodyFields)
-    blindedBlck.message.body.execution_payload_header =
-      await node.getBlindedExecutionPayload(head, slot, pubkey)
-
-    # TODO slashing protection integration? probably doesn't need unblinded
-    # block, so check before submitBlindedBlock and it's safe
-    # can broadcast or not, but in theory, mev does broadcast
-    let mergeMockDomain = compute_domain(
-      DOMAIN_BEACON_PROPOSER, defaultRuntimeConfig.BELLATRIX_FORK_VERSION)
-
-    info "FOO8", genesis_validators_root
-    let
-      blockRoot = hash_tree_root(blindedBlck)
-      signing_root = compute_block_signing_root(
-        fork, genesis_validators_root, slot, blockRoot)
-
-    # TODO refactor (because this is repeated for non-MEV)
-    blindedBlck.signature =
-      block:
-        let res = await validator.getBlockSignature(
-          fork, genesis_validators_root, slot, blockRoot, blindedBlck.message)
-        if res.isErr():
-          warn "Unable to sign block",
-               validator = shortLog(validator), error_msg = res.error()
-          return head
-        res.get()
-
-    # Everything until here can be aborted safely, so one can (TODO) have
-    # fallback to local EL.
-    let unblindedPayload =
-      (await node.restClient.submitBlindedBlock(blindedBlck)).data.data
-
-    doAssert hash_tree_root(unblindedPayload) ==
-      hash_tree_root(blindedBlck.message.body.execution_payload_header)
-    # TODO next step would be to hook this back to the rest of nimbus, and use
-    # the returned block, but that requires more than mergemock to work.
-    #
-    # in particular, create a fully signed block by coying the unblinded payload
-    # back to an otherwise identical block
-
-    # TODO a bit of weirdness here: mergemock isn't actually hooked up to anything,
-    # so after doing all this, do the normal version too, no matter what
+      # TODO reuse from elsewhere
+      fakePrivKey = ValidatorPrivKey.init(
+      "0x066e3bdc0415530e5c7fed6382d5c822c192b620203cf669903e1810a8c67d06")
+      fakePubkey = fakePrivKey.toPubKey.toPubKey
+      fake_validator_index = 2000.ValidatorIndex
+    discard await node.proposeBlockMEV(
+      validator, fake_validator_index, randao, head, slot, fakePubkey,
+      fakePrivKey)
 
   let newBlock = await makeBeaconBlockForHeadAndSlot(
       node, randao, validator_index, node.graffitiBytes, head, slot)
@@ -880,6 +927,37 @@ proc handleSyncCommitteeContributions(
       asyncSpawn signAndSendContribution(
         node, validator, subcommitteeIdx, head, slot)
 
+from std/times import epochTime
+
+proc getValidatorRegistration(
+    node: BeaconNode, pubkey: ValidatorPubKey, privkey: ValidatorPrivKey):
+    SignedValidatorRegistrationV1 =
+  const gasLimit = 30000000
+  var validatorRegistration = SignedValidatorRegistrationV1(
+    message: ValidatorRegistrationV1(
+      fee_recipient: ExecutionAddress(
+        data: distinctBase(node.getSuggestedFeeRecipient(pubkey))),
+      gas_limit: gasLimit,
+      timestamp: epochTime().uint64,
+      pubkey: pubkey))
+
+  const supportedBuilderSigningDomains = [
+    # Ropsten
+    Eth2Domain.fromHex(
+      "0x00000001d5531fd3f3906407da127817ef33c71868154c6021bdaac6866406d8"),
+    # Sepolia
+    Eth2Domain.fromHex(
+      "0x00000001d3010778cd08ee514b08fe67b6c503b510987a4ce43f42306d97c67c")]
+
+  let domain = compute_domain(
+    DOMAIN_APPLICATION_BUILDER, node.dag.cfg.GENESIS_FORK_VERSION)
+  doAssert domain in supportedBuilderSigningDomains
+  let signingRoot = compute_signing_root(validatorRegistration.message, domain)
+
+  validatorRegistration.signature =
+    blsSign(privkey, signingRoot.data).toValidatorSig
+  validatorRegistration
+
 proc handleProposal(node: BeaconNode, head: BlockRef, slot: Slot):
     Future[BlockRef] {.async.} =
   ## Perform the proposal for the given slot, iff we have a validator attached
@@ -893,6 +971,25 @@ proc handleProposal(node: BeaconNode, head: BlockRef, slot: Slot):
   let
     proposerKey = node.dag.validatorKey(proposer.get).get().toPubKey
     validator = node.attachedValidators[].getValidator(proposerKey)
+
+  static: doAssert EPOCHS_PER_VALIDATOR_REGISTRATION_SUBMISSION == 1.Epoch
+
+  if node.config.payloadBuilder.isSome and node.restClient.isNil:
+    warn "handleProposal: node.config.payloadBuilder.isSome and node.restClient.isNil"
+  elif slot.is_epoch and node.config.payloadBuilder.isSome:
+    # https://github.com/ethereum/builder-specs/blob/v0.2.0/specs/validator.md#validator-registration
+    doAssert not node.restClient.isNil
+    let
+      fakePrivKey = ValidatorPrivKey.init(
+      "0x066e3bdc0415530e5c7fed6382d5c822c192b620203cf669903e1810a8c67d06")
+      fakePubkey = fakePrivKey.toPubKey.toPubKey
+    let validatorRegistration = node.getValidatorRegistration(
+      fakePubkey, fakePrivKey)
+    info "handleProposal: validatorRegistration",
+      validatorRegistration
+    if 200 !=
+        (await node.restClient.registerValidator(@[validatorRegistration])).status:
+      warn "handleProposal: Couldn't register validator with MEV builder"
 
   return
     if validator == nil:

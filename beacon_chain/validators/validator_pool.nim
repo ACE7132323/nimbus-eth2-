@@ -358,3 +358,20 @@ proc getSlotSignature*(v: AttachedValidator, fork: Fork,
 
   v.slotSignature = some((slot, signature.get))
   return signature
+
+# https://github.com/ethereum/builder-specs/blob/v0.2.0/specs/builder.md#signing
+proc getBuilderSignature*(v: AttachedValidator, forkVersion: Version,
+                          genesis_validators_root: Eth2Digest,
+                          validatorRegistration: ValidatorRegistrationV1
+                         ): Future[SignatureResult] {.async.} =
+  return
+    case v.kind
+    of ValidatorKind.Local:
+      SignatureResult.ok(get_builder_signature(
+        forkVersion, genesis_validators_root, validatorRegistration,
+        v.data.privateKey).toValidatorSig())
+    of ValidatorKind.Remote:
+      doAssert false  # TODO
+      return default(SignatureResult)
+      #let request = Web3SignerRequest.init(fork, genesis_validators_root, slot)
+      #await v.signData(request)
